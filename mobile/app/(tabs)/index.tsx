@@ -1,10 +1,12 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { Picker } from '@react-native-picker/picker';
+import { CameraView, useCameraPermissions, type BarcodeScanningResult, type BarcodeType } from 'expo-camera';
 import Constants from 'expo-constants';
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  Modal,
   Platform,
   Pressable,
   SafeAreaView,
@@ -32,6 +34,22 @@ const sampleFavorites = [
   { name: 'Arroz Tipo 1', price: 'R$ 25,49', store: 'Mercado Central', trend: '-8%' },
   { name: 'Cafe 500g', price: 'R$ 18,90', store: 'Super Bahia', trend: '-5%' },
   { name: 'Leite integral', price: 'R$ 5,79', store: 'Comercial Sul', trend: '-3%' },
+];
+
+const supportedBarcodeTypes: BarcodeType[] = [
+  'aztec',
+  'ean13',
+  'ean8',
+  'qr',
+  'pdf417',
+  'upc_e',
+  'datamatrix',
+  'code39',
+  'code93',
+  'itf14',
+  'codabar',
+  'code128',
+  'upc_a',
 ];
 
 type Produto = {
@@ -141,6 +159,16 @@ export default function HomeScreen() {
   const [produtos, setProdutos] = useState<ProductResult[]>([]);
   const [erro, setErro] = useState('');
   const [historico, setHistorico] = useState(['Arroz tipo 1', 'Cafe 500g', 'Leite integral']);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [scannerVisible, setScannerVisible] = useState(false);
+  const [scannerLocked, setScannerLocked] = useState(false);
+  const [scannerError, setScannerError] = useState('');
+  const scannerLockedRef = useRef(false);
+
+  const resetScannerLock = () => {
+    scannerLockedRef.current = false;
+    setScannerLocked(false);
+  };
 
   const pesquisar = async () => {
     const termo = busca.trim();
@@ -181,6 +209,76 @@ export default function HomeScreen() {
       setCarregando(false);
     }
   };
+
+  const abrirScanner = async () => {
+    setScannerError('');
+    resetScannerLock();
+
+    const permission = cameraPermission?.granted
+      ? cameraPermission
+      : await requestCameraPermission();
+
+    if (!permission.granted) {
+      setScannerError('Permita o acesso a camera para ler codigos de barras.');
+      return;
+    }
+
+    setScannerVisible(true);
+  };
+
+  const fecharScanner = () => {
+    setScannerVisible(false);
+    resetScannerLock();
+  };
+
+  const handleBarcodeScanned = ({ data }: BarcodeScanningResult) => {
+    const codigo = data.trim();
+
+    if (scannerLockedRef.current || !codigo) {
+      return;
+    }
+
+    scannerLockedRef.current = true;
+    setScannerLocked(true);
+    setBusca(codigo);
+    setErro('');
+    setProdutos([]);
+    setScannerVisible(false);
+  };
+
+  const renderScanner = () => (
+    <Modal animationType="slide" onRequestClose={fecharScanner} visible={scannerVisible}>
+      <SafeAreaView style={styles.scannerScreen}>
+        <View style={styles.scannerHeader}>
+          <View>
+            <Text style={styles.scannerTitle}>Leitor de codigo</Text>
+            <Text style={styles.scannerSubtitle}>EAN, UPC, QR, Code 128 e outros padroes</Text>
+          </View>
+          <TouchableOpacity accessibilityLabel="Fechar leitor" onPress={fecharScanner} style={styles.closeButton}>
+            <MaterialIcons name="close" size={22} color="#101820" />
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.cameraShell}>
+          <CameraView
+            active={scannerVisible}
+            barcodeScannerSettings={{ barcodeTypes: supportedBarcodeTypes }}
+            facing="back"
+            onBarcodeScanned={scannerLocked ? undefined : handleBarcodeScanned}
+            style={styles.camera}
+          />
+          <View pointerEvents="none" style={styles.scanOverlay}>
+            <View style={styles.scanFrame} />
+          </View>
+        </View>
+
+        <View style={styles.scannerFooter}>
+          <MaterialIcons name="center-focus-strong" size={20} color="#0DBB7C" />
+          <Text style={styles.scannerFooterText}>Centralize o codigo na area marcada</Text>
+        </View>
+      </SafeAreaView>
+    </Modal>
+  );
 
   const renderHeader = () => (
     <View>
@@ -225,7 +323,16 @@ export default function HomeScreen() {
         {quickActions.map(action => (
           <Pressable
             key={action.label}
-            onPress={() => action.label === 'Ofertas' && setBusca('arroz')}
+            onPress={() => {
+              if (action.label === 'Escanear') {
+                abrirScanner();
+                return;
+              }
+
+              if (action.label === 'Ofertas') {
+                setBusca('arroz');
+              }
+            }}
             style={({ pressed }) => [styles.quickCard, pressed && styles.pressed]}>
             <View style={styles.quickIcon}>
               <MaterialIcons name={action.icon} size={18} color="#0DBB7C" />
@@ -235,6 +342,13 @@ export default function HomeScreen() {
           </Pressable>
         ))}
       </View>
+
+      {scannerError ? (
+        <View style={styles.alert}>
+          <MaterialIcons name="photo-camera" size={18} color="#D9534F" />
+          <Text style={styles.alertText}>{scannerError}</Text>
+        </View>
+      ) : null}
 
       <View style={styles.selectorCard}>
         <View style={styles.selectorHeader}>
@@ -289,6 +403,7 @@ export default function HomeScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
+      {renderScanner()}
       <FlatList
         contentContainerStyle={styles.content}
         data={produtos}
@@ -323,7 +438,7 @@ export default function HomeScreen() {
             </View>
           )
         }
-        ListHeaderComponent={renderHeader}
+        ListHeaderComponent={renderHeader()}
         renderItem={({ item }) => {
           const p = item.produto;
           const e = item.estabelecimento;
@@ -803,6 +918,71 @@ const styles = StyleSheet.create({
   storeDetail: {
     color: '#5B6875',
     fontSize: 10,
+    fontWeight: '800',
+  },
+  scannerScreen: {
+    backgroundColor: '#101820',
+    flex: 1,
+  },
+  scannerHeader: {
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  scannerTitle: {
+    color: '#101820',
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  scannerSubtitle: {
+    color: '#6F7C88',
+    fontSize: 11,
+    fontWeight: '700',
+    marginTop: 3,
+  },
+  closeButton: {
+    alignItems: 'center',
+    backgroundColor: '#F1F4F7',
+    borderRadius: 10,
+    height: 40,
+    justifyContent: 'center',
+    width: 40,
+  },
+  cameraShell: {
+    flex: 1,
+    overflow: 'hidden',
+  },
+  camera: {
+    flex: 1,
+  },
+  scanOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  scanFrame: {
+    borderColor: '#0DBB7C',
+    borderRadius: 16,
+    borderWidth: 3,
+    height: 190,
+    maxWidth: '82%',
+    width: 320,
+  },
+  scannerFooter: {
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'center',
+    minHeight: 68,
+    paddingHorizontal: 16,
+  },
+  scannerFooterText: {
+    color: '#172331',
+    fontSize: 13,
     fontWeight: '800',
   },
 });
