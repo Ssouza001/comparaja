@@ -1,8 +1,11 @@
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Picker } from '@react-native-picker/picker';
 import { CameraView, useCameraPermissions, type BarcodeScanningResult, type BarcodeType } from 'expo-camera';
 import Constants from 'expo-constants';
-import React, { useRef, useState } from 'react';
+import * as Location from 'expo-location';
+import { useRouter } from 'expo-router';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
@@ -25,16 +28,9 @@ const cidades = [
 
 const quickActions = [
   { icon: 'qr-code-scanner', label: 'Escanear', hint: 'GTIN' },
-  { icon: 'local-offer', label: 'Ofertas', hint: 'Hoje' },
-  { icon: 'storefront', label: 'Lojas', hint: 'Perto' },
+  { icon: 'storefront', label: 'Lojas', hint: 'GPS' },
   { icon: 'favorite', label: 'Favoritos', hint: 'Salvos' },
 ] as const;
-
-const sampleFavorites = [
-  { name: 'Arroz Tipo 1', price: 'R$ 25,49', store: 'Mercado Central', trend: '-8%' },
-  { name: 'Cafe 500g', price: 'R$ 18,90', store: 'Super Bahia', trend: '-5%' },
-  { name: 'Leite integral', price: 'R$ 5,79', store: 'Comercial Sul', trend: '-3%' },
-];
 
 const supportedBarcodeTypes: BarcodeType[] = [
   'aztec',
@@ -83,10 +79,34 @@ type ProductResult = {
   produto?: Produto;
 };
 
+type SavedFavorite = {
+  city: string;
+  gtin?: string | number;
+  id: string;
+  name: string;
+  neighborhood?: string;
+  price: string;
+  productCode?: string | number;
+  rawPrice?: number;
+  savedAt: string;
+  store: string;
+  storeDocument?: string | number;
+};
+
+type SearchLocationMode = 'city' | 'current';
+
+type UserCoordinates = {
+  accuracy?: number | null;
+  latitude: number;
+  longitude: number;
+};
+
 type ApiError = {
   erro?: string;
   mensagem?: string;
 };
+
+const FAVORITES_STORAGE_KEY = '@comparaja:favoritos';
 
 function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -127,6 +147,92 @@ function getInitials(value?: string) {
   return words.map(word => word[0]).join('').toUpperCase();
 }
 
+function getCityLabel(value: string) {
+  return cidades.find(item => item.value === value)?.label || 'Cidade selecionada';
+}
+
+function formatCoordinates(coordinates: UserCoordinates) {
+  return `${coordinates.latitude.toFixed(5)}, ${coordinates.longitude.toFixed(5)}`;
+}
+
+function formatAccuracy(value: unknown) {
+  const numericValue = Number(value);
+
+  if (!Number.isFinite(numericValue)) {
+    return null;
+  }
+
+  return `${Math.round(numericValue)} m`;
+}
+
+function normalizeFavoritePart(value: unknown, fallback: string) {
+  const text = String(value ?? '').trim();
+  return (text || fallback).toLowerCase().replace(/\s+/g, '-');
+}
+
+function getFavoriteId(item: ProductResult) {
+  const p = item.produto;
+  const e = item.estabelecimento;
+
+  return [
+    normalizeFavoritePart(p?.gtin || p?.codProduto || p?.descricao, 'produto'),
+    normalizeFavoritePart(e?.cnpj || e?.nomeEstabelecimento, 'loja'),
+    normalizeFavoritePart(item.localidade || e?.municipio, 'cidade'),
+  ].join('__');
+}
+
+function createFavorite(item: ProductResult): SavedFavorite {
+  const p = item.produto;
+  const e = item.estabelecimento;
+  const rawPrice = Number(p?.precoUnitario);
+
+  return {
+    city: item.localidade || e?.municipio || 'Cidade nao informada',
+    gtin: p?.gtin,
+    id: getFavoriteId(item),
+    name: p?.descricao || 'Produto sem nome',
+    neighborhood: e?.bairro,
+    price: formatCurrency(p?.precoUnitario),
+    productCode: p?.codProduto,
+    rawPrice: Number.isFinite(rawPrice) ? rawPrice : undefined,
+    savedAt: new Date().toISOString(),
+    store: e?.nomeEstabelecimento || 'Estabelecimento',
+    storeDocument: e?.cnpj,
+  };
+}
+
+function parseStoredFavorites(raw: string | null) {
+  if (!raw) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.filter((item): item is SavedFavorite => {
+      if (!item || typeof item !== 'object') {
+        return false;
+      }
+
+      const favorite = item as Partial<SavedFavorite>;
+      return (
+        typeof favorite.city === 'string' &&
+        typeof favorite.id === 'string' &&
+        typeof favorite.name === 'string' &&
+        typeof favorite.price === 'string' &&
+        typeof favorite.savedAt === 'string' &&
+        typeof favorite.store === 'string'
+      );
+    });
+  } catch {
+    return [];
+  }
+}
+
 function getApiBaseUrl() {
   if (Platform.OS === 'web') {
     return 'http://localhost:3001';
@@ -153,27 +259,114 @@ function getApiBaseUrl() {
 const API_BASE_URL = getApiBaseUrl();
 
 export default function HomeScreen() {
+  const router = useRouter();
   const [busca, setBusca] = useState('');
   const [cidade, setCidade] = useState(cidades[0].value);
+  const [locationMode, setLocationMode] = useState<SearchLocationMode>('city');
+  const [userCoordinates, setUserCoordinates] = useState<UserCoordinates | null>(null);
+  const [locationLoading, setLocationLoading] = useState(false);
+  const [locationError, setLocationError] = useState('');
   const [carregando, setCarregando] = useState(false);
   const [produtos, setProdutos] = useState<ProductResult[]>([]);
   const [erro, setErro] = useState('');
+  const [favoritos, setFavoritos] = useState<SavedFavorite[]>([]);
+  const [favoritosCarregados, setFavoritosCarregados] = useState(false);
   const [historico, setHistorico] = useState(['Arroz tipo 1', 'Cafe 500g', 'Leite integral']);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [scannerVisible, setScannerVisible] = useState(false);
   const [scannerLocked, setScannerLocked] = useState(false);
   const [scannerError, setScannerError] = useState('');
   const scannerLockedRef = useRef(false);
+  const favoriteIds = useMemo(() => new Set(favoritos.map(item => item.id)), [favoritos]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    AsyncStorage.getItem(FAVORITES_STORAGE_KEY)
+      .then(raw => {
+        if (mounted) {
+          setFavoritos(parseStoredFavorites(raw));
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setFavoritos([]);
+        }
+      })
+      .finally(() => {
+        if (mounted) {
+          setFavoritosCarregados(true);
+        }
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!favoritosCarregados) {
+      return;
+    }
+
+    AsyncStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favoritos)).catch(() => undefined);
+  }, [favoritos, favoritosCarregados]);
 
   const resetScannerLock = () => {
     scannerLockedRef.current = false;
     setScannerLocked(false);
   };
 
+  const carregarLocalizacaoAtual = async () => {
+    if (locationLoading) {
+      return userCoordinates;
+    }
+
+    setLocationLoading(true);
+    setLocationError('');
+
+    try {
+      const permission = await Location.requestForegroundPermissionsAsync();
+
+      if (permission.status !== 'granted') {
+        setLocationMode('city');
+        setLocationError('Permita o acesso a localizacao para buscar lojas perto de voce.');
+        return null;
+      }
+
+      const position = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+      const coordinates = {
+        accuracy: position.coords.accuracy,
+        latitude: position.coords.latitude,
+        longitude: position.coords.longitude,
+      };
+
+      setUserCoordinates(coordinates);
+      setLocationMode('current');
+      return coordinates;
+    } catch {
+      setLocationMode('city');
+      setLocationError('Nao foi possivel obter sua localizacao agora.');
+      return null;
+    } finally {
+      setLocationLoading(false);
+    }
+  };
+
   const pesquisar = async () => {
     const termo = busca.trim();
 
     if (!termo || carregando) {
+      return;
+    }
+
+    const coordinates = locationMode === 'current'
+      ? userCoordinates || await carregarLocalizacaoAtual()
+      : null;
+
+    if (locationMode === 'current' && !coordinates) {
       return;
     }
 
@@ -187,7 +380,17 @@ export default function HomeScreen() {
 
     try {
       const tipo = termo.match(/^\d+$/) ? 'gtin' : 'nome';
-      const url = `${API_BASE_URL}/produtos?${tipo}=${encodeURIComponent(termo)}&cidade=${cidade}`;
+      const params = new URLSearchParams({ [tipo]: termo });
+
+      if (coordinates) {
+        params.set('latitude', String(coordinates.latitude));
+        params.set('longitude', String(coordinates.longitude));
+        params.set('raio', '20');
+      } else {
+        params.set('cidade', cidade);
+      }
+
+      const url = `${API_BASE_URL}/produtos?${params.toString()}`;
       await sleep(300);
       const resp = await fetch(url, { signal: controller.signal });
       const data = (await resp.json()) as ProductResult[] | ApiError;
@@ -246,6 +449,24 @@ export default function HomeScreen() {
     setScannerVisible(false);
   };
 
+  const removerFavorito = (id: string) => {
+    setFavoritos(prev => prev.filter(item => item.id !== id));
+  };
+
+  const alternarFavorito = (item: ProductResult) => {
+    const favorito = createFavorite(item);
+
+    setFavoritos(prev => {
+      const isSaved = prev.some(saved => saved.id === favorito.id);
+
+      if (isSaved) {
+        return prev.filter(saved => saved.id !== favorito.id);
+      }
+
+      return [favorito, ...prev.filter(saved => saved.id !== favorito.id)].slice(0, 30);
+    });
+  };
+
   const renderScanner = () => (
     <Modal animationType="slide" onRequestClose={fecharScanner} visible={scannerVisible}>
       <SafeAreaView style={styles.scannerScreen}>
@@ -288,9 +509,9 @@ export default function HomeScreen() {
             <Text style={styles.logo}>ComparaJa</Text>
             <Text style={styles.heroSubtitle}>Preco justo perto de voce</Text>
           </View>
-          <View style={styles.avatar}>
+          <TouchableOpacity accessibilityLabel="Abrir login" onPress={() => router.push('/login')} style={styles.avatar}>
             <Text style={styles.avatarText}>CJ</Text>
-          </View>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.searchBox}>
@@ -329,8 +550,14 @@ export default function HomeScreen() {
                 return;
               }
 
-              if (action.label === 'Ofertas') {
-                setBusca('arroz');
+              if (action.label === 'Lojas') {
+                carregarLocalizacaoAtual();
+                return;
+              }
+
+              if (action.label === 'Favoritos') {
+                setErro('');
+                setProdutos([]);
               }
             }}
             style={({ pressed }) => [styles.quickCard, pressed && styles.pressed]}>
@@ -352,17 +579,78 @@ export default function HomeScreen() {
 
       <View style={styles.selectorCard}>
         <View style={styles.selectorHeader}>
-          <Text style={styles.sectionTitle}>Cidade da busca</Text>
-          <Text style={styles.sectionLink}>Atualizar</Text>
+          <Text style={styles.sectionTitle}>Local da busca</Text>
+          <Text style={styles.sectionLink}>
+            {locationMode === 'current' && userCoordinates ? 'GPS ativo' : getCityLabel(cidade)}
+          </Text>
         </View>
-        <View style={styles.pickerShell}>
-          <Picker selectedValue={cidade} style={styles.picker} onValueChange={setCidade}>
-            {cidades.map(c => (
-              <Picker.Item key={c.value} label={c.label} value={c.value} />
-            ))}
-          </Picker>
+
+        <View style={styles.locationModeRow}>
+          <TouchableOpacity
+            onPress={() => {
+              setLocationMode('city');
+              setLocationError('');
+            }}
+            style={[styles.locationModeButton, locationMode === 'city' && styles.locationModeButtonActive]}>
+            <MaterialIcons name="location-city" size={16} color={locationMode === 'city' ? '#FFFFFF' : '#66727E'} />
+            <Text style={[styles.locationModeText, locationMode === 'city' && styles.locationModeTextActive]}>Cidade</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={carregarLocalizacaoAtual}
+            style={[styles.locationModeButton, locationMode === 'current' && styles.locationModeButtonActive]}>
+            {locationLoading ? (
+              <ActivityIndicator color={locationMode === 'current' ? '#FFFFFF' : '#0DBB7C'} size="small" />
+            ) : (
+              <MaterialIcons name="my-location" size={16} color={locationMode === 'current' ? '#FFFFFF' : '#66727E'} />
+            )}
+            <Text style={[styles.locationModeText, locationMode === 'current' && styles.locationModeTextActive]}>GPS</Text>
+          </TouchableOpacity>
         </View>
+
+        {locationMode === 'city' ? (
+          <View style={styles.pickerShell}>
+            <Picker
+              selectedValue={cidade}
+              style={styles.picker}
+              onValueChange={value => {
+                setCidade(value);
+                setLocationError('');
+              }}>
+              {cidades.map(c => (
+                <Picker.Item key={c.value} label={c.label} value={c.value} />
+              ))}
+            </Picker>
+          </View>
+        ) : (
+          <View style={styles.currentLocationCard}>
+            <View style={styles.currentLocationIcon}>
+              <MaterialIcons name="near-me" size={18} color="#0DBB7C" />
+            </View>
+            <View style={styles.currentLocationBody}>
+              <Text style={styles.currentLocationLabel}>Coordenadas atuais</Text>
+              <Text numberOfLines={1} style={styles.currentLocationValue}>
+                {userCoordinates ? formatCoordinates(userCoordinates) : 'Aguardando GPS'}
+              </Text>
+              {userCoordinates?.accuracy ? (
+                <Text style={styles.currentLocationAccuracy}>Precisao aprox. {formatAccuracy(userCoordinates.accuracy)}</Text>
+              ) : null}
+            </View>
+            <TouchableOpacity
+              disabled={locationLoading}
+              onPress={carregarLocalizacaoAtual}
+              style={[styles.locationRefreshButton, locationLoading && styles.locationRefreshButtonDisabled]}>
+              <MaterialIcons name="refresh" size={17} color="#FFFFFF" />
+            </TouchableOpacity>
+          </View>
+        )}
       </View>
+
+      {locationError ? (
+        <View style={styles.alert}>
+          <MaterialIcons name="location-off" size={18} color="#D9534F" />
+          <Text style={styles.alertText}>{locationError}</Text>
+        </View>
+      ) : null}
 
       {erro ? (
         <View style={styles.alert}>
@@ -396,7 +684,7 @@ export default function HomeScreen() {
         <Text style={styles.sectionTitle}>
           {produtos.length ? 'Melhores precos encontrados' : 'Favoritos monitorados'}
         </Text>
-        <Text style={styles.sectionLink}>{produtos.length ? 'ordenado por preco' : 'salvos'}</Text>
+        <Text style={styles.sectionLink}>{produtos.length ? 'ordenado por preco' : `${favoritos.length} salvos`}</Text>
       </View>
     </View>
   );
@@ -418,23 +706,44 @@ export default function HomeScreen() {
               <ActivityIndicator color="#0DBB7C" size="large" />
               <Text style={styles.loadingText}>Consultando precos proximos...</Text>
             </View>
+          ) : !favoritosCarregados ? (
+            <View style={styles.loadingCard}>
+              <ActivityIndicator color="#0DBB7C" size="small" />
+              <Text style={styles.loadingText}>Carregando favoritos...</Text>
+            </View>
           ) : (
             <View style={styles.favoriteGrid}>
-              {sampleFavorites.map(item => (
-                <View key={item.name} style={styles.favoriteCard}>
-                  <View style={styles.favoriteImage}>
-                    <Text style={styles.favoriteInitial}>{getInitials(item.name)}</Text>
+              {favoritos.length ? (
+                favoritos.map(item => (
+                  <View key={item.id} style={styles.favoriteCard}>
+                    <View style={styles.favoriteImage}>
+                      <Text style={styles.favoriteInitial}>{getInitials(item.name)}</Text>
+                    </View>
+                    <View style={styles.favoriteBody}>
+                      <Text numberOfLines={1} style={styles.favoriteName}>{item.name}</Text>
+                      <Text numberOfLines={1} style={styles.favoriteStore}>{item.store}</Text>
+                      <View style={styles.favoriteMetaRow}>
+                        <Text style={styles.favoritePrice}>{item.price}</Text>
+                        <Text numberOfLines={1} style={styles.favoriteCity}>{item.city}</Text>
+                      </View>
+                    </View>
+                    <TouchableOpacity
+                      accessibilityLabel="Remover favorito"
+                      onPress={() => removerFavorito(item.id)}
+                      style={styles.removeFavoriteButton}>
+                      <MaterialIcons name="close" size={17} color="#5C6975" />
+                    </TouchableOpacity>
                   </View>
-                  <View style={styles.favoriteBody}>
-                    <Text numberOfLines={1} style={styles.favoriteName}>{item.name}</Text>
-                    <Text style={styles.favoriteStore}>{item.store}</Text>
-                    <Text style={styles.favoritePrice}>{item.price}</Text>
+                ))
+              ) : (
+                <View style={styles.emptyCard}>
+                  <View style={styles.emptyIcon}>
+                    <MaterialIcons name="favorite-border" size={22} color="#0DBB7C" />
                   </View>
-                  <View style={styles.trendPill}>
-                    <Text style={styles.trendText}>{item.trend}</Text>
-                  </View>
+                  <Text style={styles.emptyTitle}>Nenhum favorito salvo</Text>
+                  <Text style={styles.emptyText}>Busque um produto para escolher ofertas.</Text>
                 </View>
-              ))}
+              )}
             </View>
           )
         }
@@ -444,6 +753,8 @@ export default function HomeScreen() {
           const e = item.estabelecimento;
           const descontoFormatado = formatDecimal(p?.desconto);
           const hasDiscount = descontoFormatado && Number(p?.desconto) > 0;
+          const favoriteId = getFavoriteId(item);
+          const isFavorited = favoriteIds.has(favoriteId);
 
           return (
             <View style={styles.resultCard}>
@@ -454,8 +765,15 @@ export default function HomeScreen() {
               <View style={styles.resultBody}>
                 <View style={styles.resultTop}>
                   <Text numberOfLines={2} style={styles.productName}>{p?.descricao || 'Produto sem nome'}</Text>
-                  <TouchableOpacity accessibilityLabel="Salvar favorito" style={styles.favoriteButton}>
-                    <MaterialIcons name="favorite-border" size={18} color="#0DBB7C" />
+                  <TouchableOpacity
+                    accessibilityLabel={isFavorited ? 'Remover favorito' : 'Salvar favorito'}
+                    onPress={() => alternarFavorito(item)}
+                    style={[styles.favoriteButton, isFavorited && styles.favoriteButtonActive]}>
+                    <MaterialIcons
+                      name={isFavorited ? 'favorite' : 'favorite-border'}
+                      size={18}
+                      color={isFavorited ? '#FFFFFF' : '#0DBB7C'}
+                    />
                   </TouchableOpacity>
                 </View>
 
@@ -662,6 +980,86 @@ const styles = StyleSheet.create({
     height: 60,
     width: '100%',
   },
+  locationModeRow: {
+    backgroundColor: '#F1F4F7',
+    borderRadius: 10,
+    flexDirection: 'row',
+    gap: 6,
+    marginBottom: 10,
+    padding: 4,
+  },
+  locationModeButton: {
+    alignItems: 'center',
+    borderRadius: 8,
+    flex: 1,
+    flexDirection: 'row',
+    gap: 6,
+    justifyContent: 'center',
+    minHeight: 38,
+  },
+  locationModeButtonActive: {
+    backgroundColor: '#071126',
+  },
+  locationModeText: {
+    color: '#66727E',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  locationModeTextActive: {
+    color: '#FFFFFF',
+  },
+  currentLocationCard: {
+    alignItems: 'center',
+    backgroundColor: '#F6F8FA',
+    borderColor: '#E1E7EC',
+    borderRadius: 10,
+    borderWidth: 1,
+    flexDirection: 'row',
+    minHeight: 68,
+    padding: 10,
+  },
+  currentLocationIcon: {
+    alignItems: 'center',
+    backgroundColor: '#EAFBF4',
+    borderRadius: 10,
+    height: 36,
+    justifyContent: 'center',
+    marginRight: 10,
+    width: 36,
+  },
+  currentLocationBody: {
+    flex: 1,
+    minWidth: 0,
+  },
+  currentLocationLabel: {
+    color: '#5F6C78',
+    fontSize: 10,
+    fontWeight: '900',
+  },
+  currentLocationValue: {
+    color: '#182230',
+    fontSize: 13,
+    fontWeight: '900',
+    marginTop: 2,
+  },
+  currentLocationAccuracy: {
+    color: '#83909B',
+    fontSize: 10,
+    fontWeight: '800',
+    marginTop: 2,
+  },
+  locationRefreshButton: {
+    alignItems: 'center',
+    backgroundColor: '#0DBB7C',
+    borderRadius: 9,
+    height: 34,
+    justifyContent: 'center',
+    marginLeft: 8,
+    width: 34,
+  },
+  locationRefreshButtonDisabled: {
+    opacity: 0.64,
+  },
   alert: {
     alignItems: 'center',
     backgroundColor: '#FFF1F0',
@@ -764,6 +1162,56 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     marginTop: 6,
   },
+  favoriteMetaRow: {
+    alignItems: 'baseline',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  favoriteCity: {
+    color: '#7E8A95',
+    flexShrink: 1,
+    fontSize: 10,
+    fontWeight: '800',
+  },
+  removeFavoriteButton: {
+    alignItems: 'center',
+    backgroundColor: '#F1F4F7',
+    borderRadius: 9,
+    height: 30,
+    justifyContent: 'center',
+    marginLeft: 8,
+    width: 30,
+  },
+  emptyCard: {
+    alignItems: 'center',
+    backgroundColor: '#FFFFFF',
+    borderColor: '#E8EDF1',
+    borderRadius: 14,
+    borderWidth: 1,
+    padding: 22,
+  },
+  emptyIcon: {
+    alignItems: 'center',
+    backgroundColor: '#EAFBF4',
+    borderRadius: 12,
+    height: 42,
+    justifyContent: 'center',
+    marginBottom: 10,
+    width: 42,
+  },
+  emptyTitle: {
+    color: '#172331',
+    fontSize: 14,
+    fontWeight: '900',
+  },
+  emptyText: {
+    color: '#84909B',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 5,
+    textAlign: 'center',
+  },
   trendPill: {
     backgroundColor: '#EAFBF4',
     borderRadius: 999,
@@ -836,6 +1284,9 @@ const styles = StyleSheet.create({
     height: 30,
     justifyContent: 'center',
     width: 30,
+  },
+  favoriteButtonActive: {
+    backgroundColor: '#0DBB7C',
   },
   priceRow: {
     alignItems: 'baseline',

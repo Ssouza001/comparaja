@@ -21,15 +21,13 @@ const cidades = [
 ];
 
 const combustiveis = [
-  { label: 'Gasolina comum', value: '500', short: 'Comum' },
-  { label: 'Gasolina aditivada', value: '502', short: 'Aditivada' },
-  { label: 'Etanol', value: '503', short: 'Etanol' },
-  { label: 'Diesel S10', value: '504', short: 'S10' },
-  { label: 'Diesel comum', value: '505', short: 'Diesel' },
-  { label: 'GNV', value: '506', short: 'GNV' },
+  { label: 'Gasolina', value: 'GASOLINA', short: 'Gasolina' },
+  { label: 'Etanol', value: 'ETANOL', short: 'Etanol' },
+  { label: 'Diesel', value: 'DIESEL', short: 'Diesel' },
+  { label: 'GNV', value: 'GNV', short: 'GNV' },
 ];
 
-const recentFuelSearches = ['Gasolina comum', 'Etanol', 'Diesel S10'];
+const recentFuelSearches = ['Gasolina', 'Etanol', 'Diesel'];
 
 type Produto = {
   descricao?: string;
@@ -76,7 +74,7 @@ function getApiBaseUrl() {
   return 'http://localhost:3001';
 }
 
-function formatCurrency(value: unknown, digits = 3) {
+function formatCurrency(value: unknown, digits = 2) {
   const numericValue = Number(value);
 
   if (!Number.isFinite(numericValue)) {
@@ -113,7 +111,8 @@ export default function CombustiveiScreen() {
     const timeoutId = setTimeout(() => controller.abort(), 15000);
 
     try {
-      const url = `${API_BASE_URL}/combustiveis?anp=${combustivel}&cidade=${cidade}`;
+      const params = new URLSearchParams({ anp: combustivel, cidade });
+      const url = `${API_BASE_URL}/combustiveis?${params.toString()}`;
       const resp = await fetch(url, { signal: controller.signal });
       const data = (await resp.json().catch(() => ({}))) as FuelResult[] | ApiError;
 
